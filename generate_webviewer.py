@@ -545,9 +545,6 @@ INDEX_TEMPLATE = """
 <head>
 	<meta charset=\"UTF-8\">
 	<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
-		{% if entry.duration %}
-		<p>長さ: {{ '%.2f'|format(entry.duration) }} 秒</p>
-		{% endif %}
 	<title>Media Viewer</title>
 	<style>
 		:root {
