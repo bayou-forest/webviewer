@@ -7,7 +7,7 @@ import subprocess
 import sys
 import threading
 import time
-from dataclasses import dataclass, asdict
+from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
 from pathlib import Path
@@ -36,7 +36,9 @@ THUMB_DIR = METADATA_ROOT / "thumbnails"
 PREVIEW_DIR = METADATA_ROOT / "previews"
 DB_PATH = METADATA_ROOT / "ratings.sqlite3"
 HASH_CACHE_PATH = METADATA_ROOT / "hash_cache.json"
+VIDEO_INFO_PATH = METADATA_ROOT / "video_info.json"
 FFMPEG_BINARY = os.environ.get("FFMPEG_BIN", "ffmpeg")
+FFPROBE_BINARY = os.environ.get("FFPROBE_BIN", "ffprobe")
 VIDEO_PREVIEW_COUNT = 6
 PREVIEW_STEP_SECONDS = 2
 PREVIEW_START_SECONDS = 10
@@ -116,6 +118,26 @@ HASH_CACHE = load_hash_cache()
 HASH_CACHE_DIRTY = False
 
 
+def load_video_info_cache() -> Dict[str, Dict[str, float]]:
+	if not VIDEO_INFO_PATH.exists():
+		return {}
+	try:
+		with VIDEO_INFO_PATH.open("r", encoding="utf-8") as handle:
+			return json.load(handle)
+	except json.JSONDecodeError:
+		return {}
+
+
+def save_video_info_cache(cache: Dict[str, Dict[str, float]]) -> None:
+	with VIDEO_INFO_PATH.open("w", encoding="utf-8") as handle:
+		json.dump(cache, handle, ensure_ascii=False, indent=2)
+
+
+VIDEO_INFO_LOCK = threading.Lock()
+VIDEO_INFO_CACHE = load_video_info_cache()
+VIDEO_INFO_DIRTY = False
+
+
 def compute_file_hash(path: Path) -> str:
 	global HASH_CACHE_DIRTY
 	stat = path.stat()
@@ -146,6 +168,14 @@ def flush_hash_cache_if_needed() -> None:
 			HASH_CACHE_DIRTY = False
 
 
+def flush_video_info_cache_if_needed() -> None:
+	global VIDEO_INFO_DIRTY
+	if VIDEO_INFO_DIRTY:
+		with VIDEO_INFO_LOCK:
+			save_video_info_cache(VIDEO_INFO_CACHE)
+			VIDEO_INFO_DIRTY = False
+
+
 def generate_image_thumbnail(src: Path, dest: Path) -> None:
 	if Image is None:
 		dest.write_bytes(src.read_bytes())
@@ -172,7 +202,50 @@ def run_ffmpeg(args: List[str]) -> bool:
 		return False
 
 
-def generate_video_thumbnail(src: Path, dest: Path, offset: int) -> bool:
+def probe_video_duration(path: Path) -> Optional[float]:
+	try:
+		result = subprocess.run(
+			[
+				FFPROBE_BINARY,
+				"-v",
+				"quiet",
+				"-print_format",
+				"json",
+				"-show_format",
+				"-show_streams",
+				str(path),
+			],
+			stdout=subprocess.PIPE,
+			stderr=subprocess.PIPE,
+			check=True,
+			timeout=30,
+		)
+		payload = json.loads(result.stdout.decode() or "{}")
+		fmt = payload.get("format", {})
+		duration_raw = fmt.get("duration")
+		if duration_raw is None:
+			return None
+		return max(float(duration_raw), 0.0)
+	except Exception as exc:  # noqa: BLE001
+		log(f"ffprobe で長さ取得に失敗: {exc}")
+		return None
+
+
+def get_video_duration(media_hash: str, path: Path) -> Optional[float]:
+	global VIDEO_INFO_DIRTY
+	with VIDEO_INFO_LOCK:
+		cached = VIDEO_INFO_CACHE.get(media_hash)
+		if cached and "duration" in cached:
+			return cached["duration"]
+	duration = probe_video_duration(path)
+	if duration is not None:
+		with VIDEO_INFO_LOCK:
+			VIDEO_INFO_CACHE[media_hash] = {"duration": duration}
+			VIDEO_INFO_DIRTY = True
+	return duration
+
+
+def generate_video_thumbnail(src: Path, dest: Path, offset: float) -> bool:
 	dest.parent.mkdir(parents=True, exist_ok=True)
 	return run_ffmpeg([
 		"-y",
@@ -188,27 +261,50 @@ def generate_video_thumbnail(src: Path, dest: Path, offset: int) -> bool:
 	])
 
 
-def ensure_thumbnails(path: Path, media_hash: str, is_video: bool) -> Dict[str, List[str]]:
+def compute_thumbnail_offset(duration: Optional[float]) -> float:
+	if not duration or duration <= 0:
+		return float(PREVIEW_START_SECONDS)
+	if duration < PREVIEW_START_SECONDS:
+		return max(duration * 0.1, 0.0)
+	return float(PREVIEW_START_SECONDS)
+
+
+def compute_preview_offsets(duration: Optional[float]) -> List[float]:
+	if not duration or duration <= 0:
+		return [float(PREVIEW_START_SECONDS + PREVIEW_STEP_SECONDS * idx) for idx in range(VIDEO_PREVIEW_COUNT)]
+	step = max(duration / max(VIDEO_PREVIEW_COUNT, 1), 0.1)
+	max_time = max(duration - 0.5, 0.0)
+	offsets: List[float] = []
+	for index in range(VIDEO_PREVIEW_COUNT):
+		position = step * (index + 1)
+		if position > max_time and max_time > 0:
+			position = max_time
+		offsets.append(position)
+	return offsets
+
+
+def ensure_thumbnails(path: Path, media_hash: str, is_video: bool, duration: Optional[float]) -> Dict[str, List[str]]:
 	thumb_name = f"{media_hash}.jpg"
 	thumb_path = THUMB_DIR / thumb_name
 	preview_names: List[str] = []
 	if not thumb_path.exists():
 		if is_video:
-			if not generate_video_thumbnail(path, thumb_path, PREVIEW_START_SECONDS):
+			offset = compute_thumbnail_offset(duration)
+			if not generate_video_thumbnail(path, thumb_path, offset):
 				thumb_path.write_bytes(b"")
 		else:
 			generate_image_thumbnail(path, thumb_path)
 
 	if is_video:
-		for index in range(VIDEO_PREVIEW_COUNT):
+		offsets = compute_preview_offsets(duration)
+		for index, offset in enumerate(offsets):
 			preview_name = f"{media_hash}_{index}.jpg"
 			preview_path = PREVIEW_DIR / preview_name
 			preview_names.append(preview_name)
 			if preview_path.exists():
 				continue
-			offset = PREVIEW_START_SECONDS + PREVIEW_STEP_SECONDS * index
 			if not generate_video_thumbnail(path, preview_path, offset):
-				preview_path.touch()
+				preview_path.write_bytes(b"")
 	return {"thumbnail": thumb_name, "previews": preview_names}
 
 
@@ -249,6 +345,7 @@ class MediaEntry:
 	thumbnail_name: str
 	preview_names: List[str]
 	rating: int
+	duration: Optional[float]
 
 	def serialize(self) -> Dict[str, object]:
 		return {
@@ -263,6 +360,7 @@ class MediaEntry:
 				url_for("serve_preview", filename=name) for name in self.preview_names
 			] if self.preview_names else [],
 			"rating": self.rating,
+			"duration": self.duration,
 			"viewUrl": url_for("view_media", media_path=self.relative_path),
 			"mediaUrl": url_for("serve_media", media_path=self.relative_path),
 		}
@@ -301,7 +399,8 @@ def refresh_media_index() -> Dict[str, int]:
 		media_type = "video" if path.suffix.lower() in VIDEO_EXTENSIONS else "image"
 		media_hash = compute_file_hash(path)
 		rel = path.relative_to(APP_ROOT).as_posix()
-		thumbs = ensure_thumbnails(path, media_hash, media_type == "video")
+		duration = get_video_duration(media_hash, path) if media_type == "video" else None
+		thumbs = ensure_thumbnails(path, media_hash, media_type == "video", duration)
 		rating = rating_map.get(media_hash, 0)
 		entry = MediaEntry(
 			relative_path=rel,
@@ -313,6 +412,7 @@ def refresh_media_index() -> Dict[str, int]:
 			thumbnail_name=thumbs["thumbnail"],
 			preview_names=thumbs["previews"] if media_type == "video" else [],
 			rating=rating,
+			duration=duration,
 		)
 		new_entries.append(entry)
 
@@ -328,6 +428,7 @@ def refresh_media_index() -> Dict[str, int]:
 		SCAN_METADATA["images"] = sum(1 for e in MEDIA_CACHE if e.media_type == "image")
 
 	flush_hash_cache_if_needed()
+	flush_video_info_cache_if_needed()
 	log(f"走査完了: {len(new_entries)} 件")
 	return {
 		"total": len(new_entries),
@@ -444,6 +545,9 @@ INDEX_TEMPLATE = """
 <head>
 	<meta charset=\"UTF-8\">
 	<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">
+		{% if entry.duration %}
+		<p>長さ: {{ '%.2f'|format(entry.duration) }} 秒</p>
+		{% endif %}
 	<title>Media Viewer</title>
 	<style>
 		:root {
@@ -569,7 +673,6 @@ INDEX_TEMPLATE = """
 			</div>
 			<div class=\"meta\">
 				<strong class=\"title\"></strong>
-				<small class=\"path\"></small>
 				<small class=\"info\"></small>
 				<small class=\"rating\"></small>
 			</div>
@@ -603,8 +706,16 @@ INDEX_TEMPLATE = """
 			return `${value.toFixed(1)} ${units[idx]}`;
 		};
 
-		const formatDate = (timestamp) => {
-			return new Date(timestamp * 1000).toLocaleString();
+		const formatDuration = (seconds) => {
+			if (typeof seconds !== 'number' || !Number.isFinite(seconds) || seconds <= 0) {
+				return '';
+			}
+			const total = Math.floor(seconds);
+			const hrs = Math.floor(total / 3600);
+			const mins = Math.floor((total % 3600) / 60);
+			const secs = total % 60;
+			const pad = (value) => value.toString().padStart(2, '0');
+			return hrs > 0 ? `${hrs}:${pad(mins)}:${pad(secs)}` : `${mins}:${pad(secs)}`;
 		};
 
 		async function loadMedia() {
@@ -635,9 +746,15 @@ INDEX_TEMPLATE = """
 				img.addEventListener('mouseenter', handleHoverStart);
 				img.addEventListener('mouseleave', handleHoverEnd);
 
-				card.querySelector('.title').textContent = item.name;
-				card.querySelector('.path').textContent = item.relativePath;
-				card.querySelector('.info').textContent = `${item.type} / ${formatBytes(item.size)}`;
+				const titleEl = card.querySelector('.title');
+				titleEl.textContent = item.name;
+				titleEl.title = item.relativePath;
+				const infoParts = [`${item.type}`, formatBytes(item.size)];
+				if (item.type === 'video' && typeof item.duration === 'number') {
+					const formatted = formatDuration(item.duration);
+					if (formatted) infoParts.push(formatted);
+				}
+				card.querySelector('.info').textContent = infoParts.filter(Boolean).join(' / ');
 				card.querySelector('.rating').textContent = `評価: ${item.rating}`;
 
 				card.querySelector('.rate-up').addEventListener('click', () => vote(item, 1, card));
@@ -783,5 +900,16 @@ if __name__ == "__main__":
 # 各動画ファイルのファイルハッシュ値を計算し、それをキーにして、サムネイル画像や評価データを保存する。
 # ファイルパスが異なる、ハッシュが同一のファイルが存在する場合にも対応できるようにする。（その場合、同一ファイルとみなし、サムネイルや評価は共通としてよい。）
 # 評価データはsqlite3データベースに保存する。
+
+'''
+次のとおり仕様を追加・変更してください
+
+1. 動画の長さを取得して、データとして保存してください。一覧のファイルサイズの横に動画の長さを表示してください。
+2. 動画の長さを考慮して、サムネイル生成のオフセット時間を調整してください。動画の長さが PREVIEW_START_SECONDS 未満の場合、動画の長さの10%の時間をオフセット時間としてください。(開始から10%過ぎたところをサムネに使う、ということ)
+3. 同様に、動画の長さを考慮して、プレビュー画像のオフセット時間も調整してください。
+   動画の長さを VIDEO_PREVIEW_COUNT で割り、それをオフセット時間としてください。（60秒の動画なら,10秒おきに6枚のプレビュー画像を生成する、ということ）
+4. 動画のサムネイル生成、プレビュー画像生成に失敗した場合、空のファイルを作成し、次回以降の生成をスキップするようにしてください。
+5. 一覧にファイル名が二重に表示されています。（ファイル名とパス、ルートにある場合は同じなので。）ファイル名のみでよいです。
+'''
 
 
