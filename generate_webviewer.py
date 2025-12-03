@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sqlite3
 import subprocess
@@ -8,6 +9,7 @@ import threading
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Dict, List, Optional
 
@@ -35,6 +37,7 @@ PREVIEW_DIR = METADATA_ROOT / "previews"
 DB_PATH = METADATA_ROOT / "ratings.sqlite3"
 HASH_CACHE_PATH = METADATA_ROOT / "hash_cache.json"
 VIDEO_INFO_PATH = METADATA_ROOT / "video_info.json"
+LOG_FILE = METADATA_ROOT / "webviewer.log"
 FFMPEG_BINARY = os.environ.get("FFMPEG_BIN", "ffmpeg")
 FFPROBE_BINARY = os.environ.get("FFPROBE_BIN", "ffprobe")
 VIDEO_PREVIEW_COUNT = 6
@@ -43,14 +46,26 @@ PREVIEW_START_SECONDS = 10
 THUMB_WIDTH = 360
 HASH_CHUNK_SIZE = 4 * 1024 * 1024
 
+# Configure logging
+# Ensure the metadata directory exists so the log file can be opened.
+METADATA_ROOT.mkdir(parents=True, exist_ok=True)
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        RotatingFileHandler(LOG_FILE, maxBytes=10*1024*1024, backupCount=5)
+    ]
+)
+
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".gif", ".bmp", ".webp"}
 VIDEO_EXTENSIONS = {".mp4", ".mkv", ".mov", ".avi", ".webm", ".m4v"}
 MEDIA_EXTENSIONS = IMAGE_EXTENSIONS | VIDEO_EXTENSIONS
 
 
 def log(message: str) -> None:
-    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    print(f"[{timestamp}] {message}")
+    logging.info(message)
 
 
 def ensure_metadata_tree() -> None:
@@ -346,7 +361,11 @@ def iter_media_files() -> List[Path]:
         if METADATA_ROOT in root_path.parents or root_path == METADATA_ROOT:
             dirs[:] = []
             continue
-        dirs[:] = [d for d in dirs if not d.startswith(".")]
+            dirs[:] = [
+                d
+                for d in dirs
+                if not d.startswith('.') and d.lower() != '_metadata'
+            ]
         for filename in files:
             if filename.startswith("."):
                 continue
