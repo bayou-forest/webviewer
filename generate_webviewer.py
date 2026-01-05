@@ -40,7 +40,7 @@ VIDEO_INFO_PATH = METADATA_ROOT / "video_info.json"
 LOG_FILE = METADATA_ROOT / "webviewer.log"
 FFMPEG_BINARY = os.environ.get("FFMPEG_BIN", "ffmpeg")
 FFPROBE_BINARY = os.environ.get("FFPROBE_BIN", "ffprobe")
-VIDEO_PREVIEW_COUNT = 6
+VIDEO_PREVIEW_COUNT = 8
 PREVIEW_STEP_SECONDS = 2
 PREVIEW_START_SECONDS = 10
 THUMB_WIDTH = 360
@@ -316,6 +316,19 @@ def update_rating(media_hash: str, delta: int) -> int:
     return score
 
 
+def format_duration(seconds: Optional[float]) -> str:
+    if seconds is None or not seconds > 0:
+        return ''
+    total = int(seconds)
+    hrs = total // 3600
+    mins = (total % 3600) // 60
+    secs = total % 60
+    if hrs > 0:
+        return f"{hrs}:{mins:02d}:{secs:02d}"
+    else:
+        return f"{mins}:{secs:02d}"
+
+
 @dataclass
 class MediaEntry:
     relative_path: str
@@ -343,6 +356,7 @@ class MediaEntry:
             ] if self.preview_names else [],
             "rating": self.rating,
             "duration": self.duration,
+            "formatted_duration": format_duration(self.duration),
             "viewUrl": url_for("view_media", media_path=self.relative_path),
             "mediaUrl": url_for("serve_media", media_path=self.relative_path),
         }
@@ -434,14 +448,16 @@ refresh_media_index()
 app = Flask(__name__)
 
 
-def filter_entries(include_subfolders: bool, favorites_only: bool) -> List[Dict[str, object]]:
+def filter_entries(include_subfolders: bool, rating_filter: str) -> List[Dict[str, object]]:
     with MEDIA_LOCK:
         entries = list(MEDIA_CACHE)
     filtered: List[MediaEntry] = []
     for entry in entries:
         if not include_subfolders and "/" in entry.relative_path:
             continue
-        if favorites_only and entry.rating <= 0:
+        if rating_filter == "positive" and entry.rating <= 0:
+            continue
+        elif rating_filter == "non_negative" and entry.rating < 0:
             continue
         filtered.append(entry)
     return [entry.serialize() for entry in filtered]
@@ -455,8 +471,8 @@ def index() -> str:
 @app.route("/api/files")
 def api_files() -> "flask.Response":
     include_subfolders = request.args.get("includeSubfolders", "true").lower() == "true"
-    favorites_only = request.args.get("favoritesOnly", "false").lower() == "true"
-    data = filter_entries(include_subfolders, favorites_only)
+    rating_filter = request.args.get("ratingFilter", "all")
+    data = filter_entries(include_subfolders, rating_filter)
     return jsonify({"media": data, "scan": SCAN_METADATA})
 
 
@@ -628,20 +644,28 @@ INDEX_TEMPLATE = """
             :root {
                 font-size: 70%;
             }
+            .grid {
+                grid-template-columns: repeat(2, 1fr);
+            }
         }
     </style>
 </head>
 <body>
-    <header>
+    <header id="top">
         <h1 style=\"margin:0\">ローカルメディアビューア</h1>
+        <div id=\"anchors\"></div>
         <div class=\"controls\">
             <label>
                 <input type=\"checkbox\" id=\"includeSubfolders\" checked>
                 サブフォルダを含める
             </label>
             <label>
-                <input type=\"checkbox\" id=\"favoritesOnly\">
-                高評価のみ表示
+                評価フィルタ:
+                <select id=\"ratingFilter\">
+                    <option value=\"all\">すべて表示</option>
+                    <option value=\"positive\">高評価のみ</option>
+                    <option value=\"non_negative\">マイナス評価を表示しない</option>
+                </select>
             </label>
             <button id=\"refreshBtn\">再探索</button>
             <button id=\"lowRatedBtn\">低評価リスト出力</button>
@@ -673,11 +697,12 @@ INDEX_TEMPLATE = """
         const grid = document.getElementById('mediaGrid');
         const cardTemplate = document.getElementById('cardTemplate');
         const includeSubfolders = document.getElementById('includeSubfolders');
-        const favoritesOnly = document.getElementById('favoritesOnly');
+        const ratingFilter = document.getElementById('ratingFilter');
         const refreshBtn = document.getElementById('refreshBtn');
         const lowRatedBtn = document.getElementById('lowRatedBtn');
         const lowRatedOutput = document.getElementById('lowRatedOutput');
         const scanInfo = document.getElementById('scanInfo');
+        const anchors = document.getElementById('anchors');
         const hoverTimers = new WeakMap();
 
         const formatBytes = (bytes) => {
@@ -707,7 +732,7 @@ INDEX_TEMPLATE = """
         async function loadMedia() {
             const params = new URLSearchParams({
                 includeSubfolders: includeSubfolders.checked,
-                favoritesOnly: favoritesOnly.checked,
+                ratingFilter: ratingFilter.value,
             });
             const response = await fetch(`/api/files?${params}`);
             const data = await response.json();
@@ -722,7 +747,22 @@ INDEX_TEMPLATE = """
 
         function renderMedia(items) {
             grid.innerHTML = '';
-            items.forEach(item => {
+            anchors.innerHTML = '';
+            let anchorIndex = 1;
+            items.forEach((item, index) => {
+                if (index > 0 && index % 20 === 0) {
+                    const anchor = document.createElement('div');
+                    anchor.id = `anchor-${anchorIndex}`;
+                    anchor.innerHTML = `<a href="#top">TOPに戻る</a>`;
+                    grid.appendChild(anchor);
+                    // ページ冒頭にリンク追加
+                    const link = document.createElement('a');
+                    link.href = `#anchor-${anchorIndex}`;
+                    link.textContent = `${index + 1}件目`;
+                    anchors.appendChild(link);
+                    anchors.appendChild(document.createTextNode(' '));
+                    anchorIndex++;
+                }
                 const card = cardTemplate.content.firstElementChild.cloneNode(true);
                 const img = card.querySelector('img');
                 img.src = item.thumbnailUrl;
@@ -795,13 +835,14 @@ INDEX_TEMPLATE = """
         }
 
         includeSubfolders.addEventListener('change', loadMedia);
-        favoritesOnly.addEventListener('change', loadMedia);
+        ratingFilter.addEventListener('change', loadMedia);
         refreshBtn.addEventListener('click', refreshIndex);
         lowRatedBtn.addEventListener('click', fetchLowRated);
 
         loadMedia();
     </script>
 </body>
+
 </html>
 """
 
@@ -828,8 +869,8 @@ VIEW_TEMPLATE = """
     <header>
         <h1 class=\"title\" title=\"{{ entry.relativePath }}\">{{ entry.name }}</h1>
         <div class=\"meta\">
-            {% if entry.duration %}
-            <span>長さ: {{ '%.2f'|format(entry.duration) }} 秒</span>
+            {% if entry.formatted_duration %}
+            <span>長さ: {{ entry.formatted_duration }}</span>
             {% endif %}
             <span>評価: {{ entry.rating }}</span>
             <a href=\"/\">一覧へ戻る</a>
@@ -851,7 +892,7 @@ VIEW_TEMPLATE = """
 
 def main() -> None:
     host = os.environ.get("MEDIA_VIEWER_HOST", "0.0.0.0")
-    port = int(os.environ.get("MEDIA_VIEWER_PORT", "5000"))
+    port = int(os.environ.get("MEDIA_VIEWER_PORT", "8080"))
     log(f"サーバーを起動します: http://{host}:{port}")
     app.run(host=host, port=port, debug=False)
 
