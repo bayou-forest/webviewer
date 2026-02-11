@@ -78,6 +78,7 @@ def ensure_metadata_tree() -> None:
 
 
 def init_db() -> None:
+    import time
     ensure_metadata_tree()
     with sqlite3.connect(DB_PATH) as conn:
         conn.execute(
@@ -86,18 +87,38 @@ def init_db() -> None:
                 hash TEXT PRIMARY KEY,
                 score INTEGER NOT NULL DEFAULT 0,
                 play_count INTEGER NOT NULL DEFAULT 0,
-                updated_at REAL NOT NULL DEFAULT (strftime('%s','now'))
+                updated_at REAL NOT NULL DEFAULT 0,
+                created_at REAL NOT NULL DEFAULT 0
             );
             """
         )
-        # Migrate existing database: add play_count column if it doesn't exist
+        # Migrate existing database: add columns if they don't exist
         cursor = conn.execute("PRAGMA table_info(ratings)")
         columns = [row[1] for row in cursor.fetchall()]
+        
         if "play_count" not in columns:
             log("既存のデータベースに play_count カラムを追加しています...")
             conn.execute("ALTER TABLE ratings ADD COLUMN play_count INTEGER NOT NULL DEFAULT 0")
             conn.commit()
             log("play_count カラムの追加が完了しました。")
+        
+        if "updated_at" not in columns:
+            log("既存のデータベースに updated_at カラムを追加しています...")
+            conn.execute("ALTER TABLE ratings ADD COLUMN updated_at REAL NOT NULL DEFAULT 0")
+            # 既存レコードに現在時刻を設定
+            now = time.time()
+            conn.execute("UPDATE ratings SET updated_at = ? WHERE updated_at = 0", (now,))
+            conn.commit()
+            log("updated_at カラムの追加が完了しました。")
+        
+        if "created_at" not in columns:
+            log("既存のデータベースに created_at カラムを追加しています...")
+            conn.execute("ALTER TABLE ratings ADD COLUMN created_at REAL NOT NULL DEFAULT 0")
+            # 既存レコードに現在時刻を設定
+            now = time.time()
+            conn.execute("UPDATE ratings SET created_at = ? WHERE created_at = 0", (now,))
+            conn.commit()
+            log("created_at カラムの追加が完了しました。")
 
 
 init_db()
@@ -306,50 +327,57 @@ def fetch_ratings() -> Dict[str, int]:
         return {row[0]: row[1] for row in rows}
 
 
-def fetch_metadata() -> Dict[str, Dict[str, int]]:
+def fetch_metadata() -> Dict[str, Dict]:
     with sqlite3.connect(DB_PATH) as conn:
-        rows = conn.execute("SELECT hash, score, play_count FROM ratings").fetchall()
-        return {row[0]: {"score": row[1], "play_count": row[2]} for row in rows}
+        rows = conn.execute("SELECT hash, score, play_count, created_at FROM ratings").fetchall()
+        return {row[0]: {"score": row[1], "play_count": row[2], "created_at": row[3]} for row in rows}
 
 
 def update_rating(media_hash: str, delta: int) -> int:
+    import time
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.execute("SELECT score FROM ratings WHERE hash=?", (media_hash,))
         hit = cursor.fetchone()
         if hit:
             score = hit[0] + delta
             conn.execute(
-                "UPDATE ratings SET score=?, updated_at=strftime('%s','now') WHERE hash=?",
-                (score, media_hash),
+                "UPDATE ratings SET score=?, updated_at=? WHERE hash=?",
+                (score, time.time(), media_hash),
             )
         else:
             score = delta
+            now = time.time()
             conn.execute(
-                "INSERT INTO ratings(hash, score, updated_at) VALUES(?, ?, strftime('%s','now'))",
-                (media_hash, score),
+                "INSERT INTO ratings(hash, score, created_at, updated_at) VALUES(?, ?, ?, ?)",
+                (media_hash, score, now, now),
             )
         conn.commit()
     return score
 
 
 def increment_play_count(media_hash: str) -> int:
+    import time
     with sqlite3.connect(DB_PATH) as conn:
         cursor = conn.execute("SELECT play_count FROM ratings WHERE hash=?", (media_hash,))
         hit = cursor.fetchone()
         if hit:
             count = hit[0] + 1
             conn.execute(
-                "UPDATE ratings SET play_count=?, updated_at=strftime('%s','now') WHERE hash=?",
-                (count, media_hash),
+                "UPDATE ratings SET play_count=?, updated_at=? WHERE hash=?",
+                (count, time.time(), media_hash),
             )
         else:
             count = 1
+            now = time.time()
             conn.execute(
-                "INSERT INTO ratings(hash, play_count, updated_at) VALUES(?, ?, strftime('%s','now'))",
-                (media_hash, count),
+                "INSERT INTO ratings(hash, play_count, created_at, updated_at) VALUES(?, ?, ?, ?)",
+                (media_hash, count, now, now),
             )
         conn.commit()
     return count
+
+
+
 
 
 def format_duration(seconds: Optional[float]) -> str:
@@ -378,8 +406,17 @@ class MediaEntry:
     rating: int
     duration: Optional[float]
     play_count: int = 0
+    created_at: Optional[float] = None
 
     def serialize(self) -> Dict[str, object]:
+        import time
+        # 1週間以内の場合isNewフラグを立てる（閲覧済みかどうかはフロントエンドで判定）
+        is_new = False
+        if self.created_at:
+            week_in_seconds = 7 * 24 * 60 * 60
+            if (time.time() - self.created_at) < week_in_seconds:
+                is_new = True
+        
         return {
             "relativePath": self.relative_path,
             "name": self.name,
@@ -397,6 +434,8 @@ class MediaEntry:
             "playCount": self.play_count,
             "viewUrl": url_for("view_media", media_path=self.relative_path),
             "mediaUrl": url_for("serve_media", media_path=self.relative_path),
+            "isNew": is_new,
+            "createdAt": self.created_at if self.created_at else 0,
         }
 
 
@@ -440,7 +479,26 @@ def refresh_media_index() -> Dict[str, int]:
         relative = path.relative_to(APP_ROOT).as_posix()
         duration = get_video_duration(media_hash, path) if media_type == "video" else None
         thumbs = ensure_thumbnails(path, media_hash, media_type == "video", duration)
-        metadata = metadata_map.get(media_hash, {"score": 0, "play_count": 0})
+        metadata = metadata_map.get(media_hash, {"score": 0, "play_count": 0, "created_at": None})
+        
+        # 新規ファイルの場合、created_atを設定
+        import time
+        created_at = metadata.get("created_at")
+        if created_at is None or created_at == 0:
+            created_at = time.time()
+            # DBに登録
+            with sqlite3.connect(DB_PATH) as conn:
+                conn.execute(
+                    "INSERT OR IGNORE INTO ratings(hash, created_at, updated_at) VALUES(?, ?, ?)",
+                    (media_hash, created_at, created_at),
+                )
+                # 既存レコードの場合はUPDATE
+                conn.execute(
+                    "UPDATE ratings SET created_at=?, updated_at=? WHERE hash=? AND created_at=0",
+                    (created_at, created_at, media_hash),
+                )
+                conn.commit()
+        
         stat = path.stat()
         entry = MediaEntry(
             relative_path=relative,
@@ -454,6 +512,7 @@ def refresh_media_index() -> Dict[str, int]:
             rating=metadata.get("score", 0),
             duration=duration,
             play_count=metadata.get("play_count", 0),
+            created_at=created_at,
         )
         new_entries.append(entry)
 
@@ -553,6 +612,9 @@ def api_play() -> "flask.Response":
             if entry.media_hash == media_hash:
                 entry.play_count = new_count
     return jsonify({"hash": media_hash, "playCount": new_count})
+
+
+
 
 
 @app.route("/api/low-rated")
@@ -684,7 +746,10 @@ INDEX_TEMPLATE = """
             box-shadow: 0 6px 12px rgba(0,0,0,0.35);
         }
         .card.unplayed {
-            background: #2a3040;
+            background: #3a4a5f;
+        }
+        .card.played-once {
+            background: #2a3545;
         }
         .thumb-wrapper {
             position: relative;
@@ -692,6 +757,19 @@ INDEX_TEMPLATE = """
             background: #000;
             border-radius: 8px;
             overflow: hidden;
+        }
+        .thumb-wrapper .new-badge {
+            position: absolute;
+            top: 0.5rem;
+            right: 0.5rem;
+            background: #ef4444;
+            color: #fff;
+            padding: 0.25rem 0.5rem;
+            border-radius: 4px;
+            font-size: 0.75rem;
+            font-weight: bold;
+            z-index: 10;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.5);
         }
         .thumb-wrapper img {
             position: absolute;
@@ -780,7 +858,22 @@ INDEX_TEMPLATE = """
                     <option value="zero">再生回数0</option>
                     <option value="non_zero">再生回数0以上</option>
                 </select>
-            </label>            <button id=\"refreshBtn\">再探索</button>
+            </label>            <label>
+                並び順:
+                <select id=\"sortBy\">
+                    <option value=\"name\">ファイル名</option>
+                    <option value=\"created\">登録日</option>
+                    <option value=\"rating\">評価</option>
+                    <option value=\"playCount\">再生回数</option>
+                </select>
+            </label>
+            <label>
+                <select id=\"sortOrder\">
+                    <option value=\"asc\">昇順</option>
+                    <option value=\"desc\">降順</option>
+                </select>
+            </label>
+            <button id=\"refreshBtn\">再探索</button>
             <button id=\"lowRatedBtn\">低評価リスト出力</button>
             <button id=\"moveNegativeBtn\" class=\"danger\">マイナス評価を_minusへ移動</button>
         </div>
@@ -813,6 +906,8 @@ INDEX_TEMPLATE = """
         const includeSubfolders = document.getElementById('includeSubfolders');
         const ratingFilter = document.getElementById('ratingFilter');
         const playCountFilter = document.getElementById('playCountFilter');
+        const sortBy = document.getElementById('sortBy');
+        const sortOrder = document.getElementById('sortOrder');
         const refreshBtn = document.getElementById('refreshBtn');
         const lowRatedBtn = document.getElementById('lowRatedBtn');
         const moveNegativeBtn = document.getElementById('moveNegativeBtn');
@@ -820,6 +915,7 @@ INDEX_TEMPLATE = """
         const scanInfo = document.getElementById('scanInfo');
         const anchors = document.getElementById('anchors');
         const hoverTimers = new WeakMap();
+        let currentMediaData = [];
 
         const formatBytes = (bytes) => {
             if (!bytes) return '0 B';
@@ -853,8 +949,49 @@ INDEX_TEMPLATE = """
             });
             const response = await fetch(`/api/files?${params}`);
             const data = await response.json();
-            renderMedia(data.media);
+            currentMediaData = data.media;
+            sortAndRenderMedia();
             renderScanInfo(data.scan);
+        }
+
+        function sortAndRenderMedia() {
+            const sortByValue = sortBy.value;
+            const sortOrderValue = sortOrder.value;
+            const sorted = [...currentMediaData];
+
+            sorted.sort((a, b) => {
+                let aVal, bVal;
+
+                switch (sortByValue) {
+                    case 'name':
+                        aVal = a.name.toLowerCase();
+                        bVal = b.name.toLowerCase();
+                        break;
+                    case 'created':
+                        aVal = a.createdAt || 0;
+                        bVal = b.createdAt || 0;
+                        break;
+                    case 'rating':
+                        aVal = a.rating;
+                        bVal = b.rating;
+                        break;
+                    case 'playCount':
+                        aVal = a.playCount;
+                        bVal = b.playCount;
+                        break;
+                    default:
+                        aVal = a.name.toLowerCase();
+                        bVal = b.name.toLowerCase();
+                }
+
+                let comparison = 0;
+                if (aVal < bVal) comparison = -1;
+                else if (aVal > bVal) comparison = 1;
+
+                return sortOrderValue === 'desc' ? -comparison : comparison;
+            });
+
+            renderMedia(sorted);
         }
 
         function renderScanInfo(info) {
@@ -881,6 +1018,7 @@ INDEX_TEMPLATE = """
                     anchorIndex++;
                 }
                 const card = cardTemplate.content.firstElementChild.cloneNode(true);
+                const thumbWrapper = card.querySelector('.thumb-wrapper');
                 const img = card.querySelector('img');
                 img.src = item.thumbnailUrl;
                 img.dataset.thumbnail = item.thumbnailUrl;
@@ -889,9 +1027,22 @@ INDEX_TEMPLATE = """
                 img.addEventListener('mouseenter', handleHoverStart);
                 img.addEventListener('mouseleave', handleHoverEnd);
 
+                // 新着バッジを表示（localStorageで閲覧済みチェック）
+                if (item.isNew) {
+                    const viewedItems = JSON.parse(localStorage.getItem('viewedMediaItems') || '[]');
+                    if (!viewedItems.includes(item.hash)) {
+                        const badge = document.createElement('div');
+                        badge.className = 'new-badge';
+                        badge.textContent = 'NEW';
+                        thumbWrapper.appendChild(badge);
+                    }
+                }
+
                 // Mark unplayed items
                 if (item.playCount === 0) {
                     card.classList.add('unplayed');
+                } else if (item.playCount === 1) {
+                    card.classList.add('played-once');
                 }
 
                 const titleEl = card.querySelector('.title');
@@ -979,6 +1130,8 @@ INDEX_TEMPLATE = """
         includeSubfolders.addEventListener('change', loadMedia);
         ratingFilter.addEventListener('change', loadMedia);
         playCountFilter.addEventListener('change', loadMedia);
+        sortBy.addEventListener('change', sortAndRenderMedia);
+        sortOrder.addEventListener('change', sortAndRenderMedia);
         refreshBtn.addEventListener('click', refreshIndex);
         lowRatedBtn.addEventListener('click', fetchLowRated);
         moveNegativeBtn.addEventListener('click', moveNegativeFiles);
@@ -1074,6 +1227,21 @@ VIEW_TEMPLATE = """
                 console.error('再生回数の更新に失敗:', err);
             }
         }
+
+        function markViewedInLocalStorage() {
+            try {
+                const viewedItems = JSON.parse(localStorage.getItem('viewedMediaItems') || '[]');
+                if (!viewedItems.includes(hash)) {
+                    viewedItems.push(hash);
+                    localStorage.setItem('viewedMediaItems', JSON.stringify(viewedItems));
+                }
+            } catch (err) {
+                console.error('localStorageへの保存に失敗:', err);
+            }
+        }
+
+        // ページ読み込み時に閲覧済みマークを付ける（localStorage）
+        markViewedInLocalStorage();
 
         document.getElementById('rateUp').addEventListener('click', () => vote(1));
         document.getElementById('rateDown').addEventListener('click', () => vote(-1));
