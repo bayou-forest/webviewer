@@ -1,0 +1,11 @@
+# 認証情報
+.env
+
+# メタデータ
+_metadata/
+_minus/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo

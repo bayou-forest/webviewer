@@ -1,11 +1,18 @@
 from __future__ import annotations
 
+import hmac
 import json
 import logging
 import os
 import sqlite3
 import subprocess
 import threading
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass  # python-dotenv が未インストールの場合はスキップ
 from dataclasses import dataclass
 from datetime import datetime
 from hashlib import sha256
@@ -41,6 +48,8 @@ VIDEO_INFO_PATH = METADATA_ROOT / "video_info.json"
 LOG_FILE = METADATA_ROOT / "webviewer.log"
 FFMPEG_BINARY = os.environ.get("FFMPEG_BIN", "ffmpeg")
 FFPROBE_BINARY = os.environ.get("FFPROBE_BIN", "ffprobe")
+BASIC_AUTH_USERNAME = os.environ.get("BASIC_AUTH_USERNAME", "")
+BASIC_AUTH_PASSWORD = os.environ.get("BASIC_AUTH_PASSWORD", "")
 VIDEO_PREVIEW_COUNT = 8
 PREVIEW_STEP_SECONDS = 2
 PREVIEW_START_SECONDS = 10
@@ -544,6 +553,29 @@ refresh_media_index()
 
 
 app = Flask(__name__)
+
+
+def _auth_required() -> "flask.Response":
+    from flask import Response
+    return Response(
+        "認証が必要です",
+        401,
+        {"WWW-Authenticate": 'Basic realm="Media Viewer"'},
+    )
+
+
+@app.before_request
+def check_basic_auth():
+    """BASIC_AUTH_USERNAME と BASIC_AUTH_PASSWORD が設定されている場合にベーシック認証を行う。"""
+    if not BASIC_AUTH_USERNAME or not BASIC_AUTH_PASSWORD:
+        return  # 環境変数未設定時は認証をスキップ
+    auth = request.authorization
+    if not auth or auth.type != "basic":
+        return _auth_required()
+    username_ok = hmac.compare_digest(auth.username or "", BASIC_AUTH_USERNAME)
+    password_ok = hmac.compare_digest(auth.password or "", BASIC_AUTH_PASSWORD)
+    if not (username_ok and password_ok):
+        return _auth_required()
 
 
 def filter_entries(include_subfolders: bool, rating_filter: str, play_count_filter: str = "all") -> List[Dict[str, object]]:
@@ -1058,7 +1090,13 @@ INDEX_TEMPLATE = """
 
                 card.querySelector('.rate-up').addEventListener('click', () => vote(item, 1, card));
                 card.querySelector('.rate-down').addEventListener('click', () => vote(item, -1, card));
-                card.querySelector('.view-link').href = item.viewUrl;
+                
+                const viewLink = card.querySelector('.view-link');
+                viewLink.href = item.viewUrl;
+                // 詳細ボタンクリック時にlocalStorageに記録し、NEWバッジを削除
+                viewLink.addEventListener('click', () => {
+                    markItemAsViewed(item.hash, thumbWrapper);
+                });
 
                 grid.appendChild(card);
             });
@@ -1074,6 +1112,23 @@ INDEX_TEMPLATE = """
             const payload = await response.json();
             item.rating = payload.rating;
             card.querySelector('.rating').textContent = `評価: ${item.rating}`;
+        }
+
+        function markItemAsViewed(hash, thumbWrapper) {
+            try {
+                const viewedItems = JSON.parse(localStorage.getItem('viewedMediaItems') || '[]');
+                if (!viewedItems.includes(hash)) {
+                    viewedItems.push(hash);
+                    localStorage.setItem('viewedMediaItems', JSON.stringify(viewedItems));
+                }
+                // NEWバッジを削除
+                const badge = thumbWrapper.querySelector('.new-badge');
+                if (badge) {
+                    badge.remove();
+                }
+            } catch (err) {
+                console.error('閲覧済みマークの記録に失敗:', err);
+            }
         }
 
         function handleHoverStart(event) {
