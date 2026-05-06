@@ -578,16 +578,16 @@ def check_basic_auth():
         return _auth_required()
 
 
-def filter_entries(include_subfolders: bool, rating_filter: str, play_count_filter: str = "all") -> List[Dict[str, object]]:
+def filter_entries(include_subfolders: bool, rating_filter: str, rating_value: int = 0, play_count_filter: str = "all") -> List[Dict[str, object]]:
     with MEDIA_LOCK:
         entries = list(MEDIA_CACHE)
     filtered: List[MediaEntry] = []
     for entry in entries:
         if not include_subfolders and "/" in entry.relative_path:
             continue
-        if rating_filter == "positive" and entry.rating <= 0:
+        if rating_filter == "above" and entry.rating < rating_value:
             continue
-        elif rating_filter == "non_negative" and entry.rating < 0:
+        elif rating_filter == "below" and entry.rating > rating_value:
             continue
         if play_count_filter == "zero" and entry.play_count != 0:
             continue
@@ -606,8 +606,13 @@ def index() -> str:
 def api_files() -> "flask.Response":
     include_subfolders = request.args.get("includeSubfolders", "true").lower() == "true"
     rating_filter = request.args.get("ratingFilter", "all")
+    try:
+        rating_value = int(request.args.get("ratingValue", "0"))
+        rating_value = max(-10, min(10, rating_value))
+    except (ValueError, TypeError):
+        rating_value = 0
     play_count_filter = request.args.get("playCountFilter", "all")
-    data = filter_entries(include_subfolders, rating_filter, play_count_filter)
+    data = filter_entries(include_subfolders, rating_filter, rating_value, play_count_filter)
     return jsonify({"media": data, "scan": SCAN_METADATA})
 
 
@@ -877,11 +882,15 @@ INDEX_TEMPLATE = """
                 サブフォルダを含める
             </label>
             <label>
+                評価値:
+                <input type=\"number\" id=\"ratingValue\" min=\"-10\" max=\"10\" value=\"0\" style=\"width:4rem;background:#0f1218;color:#fff;border:1px solid #2f3440;border-radius:4px;padding:0.2rem 0.4rem\">
+            </label>
+            <label>
                 評価フィルタ:
                 <select id=\"ratingFilter\">
-                    <option value=\"all\">すべて表示</option>
-                    <option value=\"positive\">高評価のみ</option>
-                    <option value=\"non_negative\">マイナス評価を表示しない</option>
+                    <option value=\"all\">全て表示</option>
+                    <option value=\"above\">評価値以上</option>
+                    <option value=\"below\">評価値以下</option>
                 </select>
             </label>            <label>
                 再生回数フィルタ:
@@ -906,14 +915,14 @@ INDEX_TEMPLATE = """
                 </select>
             </label>
             <button id=\"refreshBtn\">再探索</button>
-            <button id=\"lowRatedBtn\">低評価リスト出力</button>
+            <button id=\"exportListBtn\">表示中リスト出力</button>
             <button id=\"moveNegativeBtn\" class=\"danger\">マイナス評価を_minusへ移動</button>
         </div>
         <div id=\"scanInfo\"></div>
     </header>
     <main>
         <section class=\"grid\" id=\"mediaGrid\"></section>
-        <textarea id=\"lowRatedOutput\" placeholder=\"低評価リストはここに出力されます\" readonly></textarea>
+        <textarea id=\"lowRatedOutput\" placeholder=\"表示中リストはここに出力されます\" readonly></textarea>
     </main>
     <template id=\"cardTemplate\">
         <article class=\"card\">
@@ -937,17 +946,19 @@ INDEX_TEMPLATE = """
         const cardTemplate = document.getElementById('cardTemplate');
         const includeSubfolders = document.getElementById('includeSubfolders');
         const ratingFilter = document.getElementById('ratingFilter');
+        const ratingValue = document.getElementById('ratingValue');
         const playCountFilter = document.getElementById('playCountFilter');
         const sortBy = document.getElementById('sortBy');
         const sortOrder = document.getElementById('sortOrder');
         const refreshBtn = document.getElementById('refreshBtn');
-        const lowRatedBtn = document.getElementById('lowRatedBtn');
+        const exportListBtn = document.getElementById('exportListBtn');
         const moveNegativeBtn = document.getElementById('moveNegativeBtn');
         const lowRatedOutput = document.getElementById('lowRatedOutput');
         const scanInfo = document.getElementById('scanInfo');
         const anchors = document.getElementById('anchors');
         const hoverTimers = new WeakMap();
         let currentMediaData = [];
+        let currentSortedData = [];
 
         const formatBytes = (bytes) => {
             if (!bytes) return '0 B';
@@ -977,6 +988,7 @@ INDEX_TEMPLATE = """
             const params = new URLSearchParams({
                 includeSubfolders: includeSubfolders.checked,
                 ratingFilter: ratingFilter.value,
+                ratingValue: ratingValue.value,
                 playCountFilter: playCountFilter.value,
             });
             const response = await fetch(`/api/files?${params}`);
@@ -1032,6 +1044,7 @@ INDEX_TEMPLATE = """
         }
 
         function renderMedia(items) {
+            currentSortedData = items;
             grid.innerHTML = '';
             anchors.innerHTML = '';
             let anchorIndex = 1;
@@ -1156,10 +1169,8 @@ INDEX_TEMPLATE = """
             refreshBtn.disabled = false;
         }
 
-        async function fetchLowRated() {
-            const response = await fetch('/api/low-rated?threshold=0');
-            const data = await response.json();
-            lowRatedOutput.value = data.paths.join('\\n');
+        function exportCurrentList() {
+            lowRatedOutput.value = currentSortedData.map(item => item.relativePath).join('\\n');
         }
 
         async function moveNegativeFiles() {
@@ -1184,11 +1195,12 @@ INDEX_TEMPLATE = """
 
         includeSubfolders.addEventListener('change', loadMedia);
         ratingFilter.addEventListener('change', loadMedia);
+        ratingValue.addEventListener('change', loadMedia);
         playCountFilter.addEventListener('change', loadMedia);
         sortBy.addEventListener('change', sortAndRenderMedia);
         sortOrder.addEventListener('change', sortAndRenderMedia);
         refreshBtn.addEventListener('click', refreshIndex);
-        lowRatedBtn.addEventListener('click', fetchLowRated);
+        exportListBtn.addEventListener('click', exportCurrentList);
         moveNegativeBtn.addEventListener('click', moveNegativeFiles);
 
         loadMedia();
